@@ -110,6 +110,21 @@ main { padding: 22px 28px 60px; max-width: 1500px; margin: 0 auto; }
 .num.neg { color: var(--danger); font-weight: 700; }
 .num.pos { color: var(--ok); }
 .reserved-detail { display: block; font-size: 11px; color: var(--muted); font-weight: 400; }
+.muted { color: var(--muted); }
+
+/* 额度组 */
+.group-note { display: block; font-size: 11px; color: var(--muted); font-weight: 400; margin-top: 2px; }
+.group-members { display: flex; flex-direction: column; gap: 4px; min-width: 280px; }
+.group-member { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.gm-nums { font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+.chip-group { background: #f0ecf9; border-color: #d8cef0; color: #5b3fa1; }
+.gp-members-row { align-items: flex-start; }
+.gp-members-row label { padding-top: 7px; }
+#gp_members { flex: 1; min-width: 0; }
+.gp-preview { margin: -4px 0 10px 170px; line-height: 1.7; }
+.gp-preview b { font-family: var(--mono); }
+.gp-members-detail { font-size: 11.5px; color: var(--muted); }
+.gp-neg { color: var(--danger); }
 
 .blocked-cell { background: var(--blocked-bg); }
 .gap-list { margin: 6px 0 0; padding-left: 18px; font-size: 12px; color: var(--blocked); }

@@ -51,6 +51,10 @@ function loadArtworks(db) {
   return db.prepare('SELECT * FROM artworks ORDER BY id').all();
 }
 
+function loadGroups(db) {
+  return db.prepare('SELECT * FROM budget_groups ORDER BY id').all();
+}
+
 function loadSlots(db) {
   const slots = db.prepare('SELECT * FROM slots ORDER BY planned_start, seq, id').all();
   const links = db.prepare('SELECT * FROM slot_artworks').all();
@@ -263,21 +267,16 @@ function slotDto(slot, artworksById, correctionsBySlot) {
 }
 
 // ---------- 汇总 ----------
-function summarize(db) {
-  const artworks = loadArtworks(db);
-  const slots = loadSlots(db);
-  const artworksById = new Map(artworks.map((a) => [a.id, a]));
-  const correctionsBySlot = new Map();
-  for (const c of loadCorrections(db)) {
-    if (!correctionsBySlot.has(c.slotId)) correctionsBySlot.set(c.slotId, []);
-    correctionsBySlot.get(c.slotId).push(c);
-  }
-
+// 按作品与额度组分别累计：
+//   used = 既有累计 + 已结束时段实际曝光
+//   reservedRunning = 进行中（冻结）预占
+//   reservedScheduled = 未开始时段计划曝光（含被标记不可启动的时段）
+// 同一时段若含同组多件作品，则逐件计入组额度。
+function collectTotals(artworks, slots) {
   const acc = new Map();
   for (const a of artworks) {
     acc.set(a.id, { used: a.existing_amount, reservedRunning: 0, reservedScheduled: 0 });
   }
-
   for (const slot of slots) {
     const expo = plannedExposure(slot);
     const actual = slot.status === 'finished' ? slot.actual_exposure : null;
@@ -289,6 +288,67 @@ function summarize(db) {
       else row.reservedScheduled += expo || 0; // 含被标记为不可启动的时段
     }
   }
+  return acc;
+}
+
+function groupDto(g, members, acc) {
+  let used = 0, reservedRunning = 0, reservedScheduled = 0;
+  const memberDtos = [];
+  for (const a of members) {
+    const r = acc.get(a.id);
+    const mUsed = round3(r.used);
+    const mRun = round3(r.reservedRunning);
+    const mSch = round3(r.reservedScheduled);
+    used += mUsed;
+    reservedRunning += mRun;
+    reservedScheduled += mSch;
+    memberDtos.push({
+      artworkId: a.id,
+      artworkName: a.name,
+      used: mUsed,
+      reservedRunning: mRun,
+      reservedScheduled: mSch,
+      reserved: round3(mRun + mSch),
+      committed: round3(mUsed + mRun + mSch),
+    });
+  }
+  used = round3(used);
+  reservedRunning = round3(reservedRunning);
+  reservedScheduled = round3(reservedScheduled);
+  const reserved = round3(reservedRunning + reservedScheduled);
+  const committed = round3(used + reserved);
+  const balance = round3(g.limit_amount - committed);
+  memberDtos.sort((x, y) => x.artworkId - y.artworkId);
+  return {
+    id: g.id,
+    name: g.name,
+    limit: g.limit_amount,
+    note: g.note,
+    memberCount: members.length,
+    used,
+    reserved,
+    reservedRunning,
+    reservedScheduled,
+    committed,
+    balance,
+    over: balance < 0,
+    members: memberDtos,
+  };
+}
+
+function summarize(db) {
+  const artworks = loadArtworks(db);
+  const groups = loadGroups(db);
+  const slots = loadSlots(db);
+  const artworksById = new Map(artworks.map((a) => [a.id, a]));
+  const groupsById = new Map(groups.map((g) => [g.id, g]));
+  const correctionsBySlot = new Map();
+  for (const c of loadCorrections(db)) {
+    if (!correctionsBySlot.has(c.slotId)) correctionsBySlot.set(c.slotId, []);
+    correctionsBySlot.get(c.slotId).push(c);
+  }
+
+  const acc = collectTotals(artworks, slots);
 
   const artworkDtos = artworks.map((a) => {
     const r = acc.get(a.id);
@@ -296,12 +356,15 @@ function summarize(db) {
     const reserved = round3(r.reservedRunning + r.reservedScheduled);
     const committed = round3(used + reserved);
     const balance = round3(a.limit_amount - committed);
+    const g = a.group_id != null ? groupsById.get(a.group_id) : null;
     return {
       id: a.id,
       name: a.name,
       limit: a.limit_amount,
       existing: a.existing_amount,
       note: a.note,
+      groupId: a.group_id ?? null,
+      groupName: g ? g.name : null,
       used,
       reserved,
       reservedRunning: round3(r.reservedRunning),
@@ -312,29 +375,56 @@ function summarize(db) {
     };
   });
 
+  // 额度组：逐成员累计后汇总（同一时段多件组内作品逐件计入）
+  const membersByGroup = new Map(groups.map((g) => [g.id, []]));
+  for (const a of artworks) if (a.group_id != null && membersByGroup.has(a.group_id)) membersByGroup.get(a.group_id).push(a);
+  const groupDtos = groups.map((g) => groupDto(g, membersByGroup.get(g.id) || [], acc));
+
   return {
     version: db.prepare('SELECT version FROM meta WHERE id = 1').get().version,
+    groups: groupDtos,
     artworks: artworkDtos,
     slots: slots.map((s) => slotDto(s, artworksById, correctionsBySlot)),
   };
 }
 
 // ---------- 预算核算：按开始时间/编号顺序标记不可启动的时段 ----------
-// 规则：按时序逐个尝试放入未开始时段，任一关联作品余额不足即标记为不可启动
-// 并记下缺口；被标记的时段视为不会启动，不再占用后续预算。
+// 规则：按时序逐个尝试放入未开始时段，任一关联作品（单件上限或其所属额度组上限）
+// 余额不足即标记为不可启动并记下缺口；被标记的时段视为不会启动，不再占用后续预算。
 function recomputeBlocked(db) {
   const slots = loadSlots(db);
   const artworks = loadArtworks(db);
+  const groups = loadGroups(db);
   const used = new Map(artworks.map((a) => [a.id, a.existing_amount]));
   const names = new Map(artworks.map((a) => [a.id, a.name]));
   const limits = new Map(artworks.map((a) => [a.id, a.limit_amount]));
+  const groupOf = new Map(artworks.map((a) => [a.id, a.group_id ?? null]));
+  const groupName = new Map(groups.map((g) => [g.id, g.name]));
+  const groupLimit = new Map(groups.map((g) => [g.id, g.limit_amount]));
+  // 组基线 = 组内各成员（既有 + 已结束实际 + 进行中冻结预占）之和
+  const groupUsed = new Map(groups.map((g) => [g.id, 0]));
+
+  const addToGroup = (aid, amount) => {
+    const gid = groupOf.get(aid);
+    if (gid != null && groupUsed.has(gid)) groupUsed.set(gid, groupUsed.get(gid) + amount);
+  };
+  for (const a of artworks) addToGroup(a.id, a.existing_amount);
 
   for (const s of slots) {
     if (s.status === 'finished') {
-      for (const aid of s.artworkIds) if (used.has(aid)) used.set(aid, used.get(aid) + (s.actual_exposure || 0));
+      for (const aid of s.artworkIds) {
+        if (!used.has(aid)) continue;
+        const v = s.actual_exposure || 0;
+        used.set(aid, used.get(aid) + v);
+        addToGroup(aid, v);
+      }
     } else if (s.status === 'running') {
       const expo = plannedExposure(s) || 0;
-      for (const aid of s.artworkIds) if (used.has(aid)) used.set(aid, used.get(aid) + expo);
+      for (const aid of s.artworkIds) {
+        if (!used.has(aid)) continue;
+        used.set(aid, used.get(aid) + expo);
+        addToGroup(aid, expo);
+      }
     }
   }
 
@@ -349,25 +439,58 @@ function recomputeBlocked(db) {
   for (const s of ordered) {
     const expo = plannedExposure(s) || 0;
     const gaps = [];
+    // 单件上限核算
     for (const aid of s.artworkIds) {
       if (!used.has(aid)) continue;
       const projected = used.get(aid) + expo;
       if (projected > limits.get(aid) + 1e-9) {
         gaps.push({
+          kind: 'artwork',
           artworkId: aid,
           artworkName: names.get(aid),
-          has: round3(limits.get(aid) - used.get(aid)),         // 当前可用余额
-          need: round3(expo),                                    // 本时段需求
-          gap: round3(projected - limits.get(aid)),              // 缺口
+          has: round3(limits.get(aid) - used.get(aid)),   // 当前可用余额
+          need: round3(expo),                              // 本时段需求
+          gap: round3(projected - limits.get(aid)),        // 缺口
         });
       }
     }
-    if (gaps.length > 0) {
-      upd.run(1, JSON.stringify({ gaps }), s.id);
-      // 不可启动：不占用后续预算
+    // 额度组上限核算：同时段多件组内作品逐件计入
+    const byGroup = new Map(); // gid -> [{aid, need}]
+    for (const aid of s.artworkIds) {
+      const gid = groupOf.get(aid);
+      if (gid == null || !groupUsed.has(gid)) continue;
+      if (!byGroup.has(gid)) byGroup.set(gid, []);
+      byGroup.get(gid).push(aid);
+    }
+    const groupGaps = [];
+    for (const [gid, memberIds] of byGroup) {
+      const need = round3(memberIds.length * expo);
+      const projected = round3(groupUsed.get(gid) + need);
+      if (projected > groupLimit.get(gid) + 1e-9) {
+        groupGaps.push({
+          kind: 'group',
+          groupId: gid,
+          groupName: groupName.get(gid),
+          has: round3(groupLimit.get(gid) - groupUsed.get(gid)),
+          need,
+          gap: round3(projected - groupLimit.get(gid)),
+          contributions: memberIds.map((aid) => ({
+            artworkId: aid,
+            artworkName: names.get(aid),
+            need: round3(expo),
+          })),
+        });
+      }
+    }
+    if (gaps.length > 0 || groupGaps.length > 0) {
+      upd.run(1, JSON.stringify({ gaps, groupGaps }), s.id);
+      // 不可启动：不占用后续预算（单件与组两层均不占用）
     } else {
       upd.run(0, '{}', s.id);
-      for (const aid of s.artworkIds) if (used.has(aid)) used.set(aid, used.get(aid) + expo);
+      for (const aid of s.artworkIds) {
+        if (used.has(aid)) used.set(aid, used.get(aid) + expo);
+        addToGroup(aid, expo);
+      }
     }
   }
   // 进行中 / 已结束时段不参与“不可启动”标记
@@ -385,6 +508,7 @@ module.exports = {
   round3,
   isNonNegNumber,
   loadArtworks,
+  loadGroups,
   loadSlots,
   loadCorrections,
   loadSegments,

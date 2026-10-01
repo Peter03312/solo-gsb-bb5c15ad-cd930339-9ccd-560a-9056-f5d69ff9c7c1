@@ -105,6 +105,112 @@ function deleteArtwork(db, id, body) {
   return tx.immediate();
 }
 
+// ---------- 共享曝光额度组 ----------
+// 维护组名称、非负上限与成员；每件作品至多归属一组；
+// 成员列表中的重复编号、不存在作品或已归属其他组的作品一律拒绝。
+function validateGroup(body, db, selfId = null) {
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  if (!name) throw new HttpError(422, 'VALIDATION', '额度组名称不能为空', { field: 'name' });
+  if (name.length > 100) throw new HttpError(422, 'VALIDATION', '额度组名称过长（最多 100 字）', { field: 'name' });
+  const dup = db.prepare('SELECT id FROM budget_groups WHERE name = ?').get(name);
+  if (dup && dup.id !== selfId) {
+    throw new HttpError(422, 'VALIDATION', `额度组名称「${name}」已存在`, { field: 'name' });
+  }
+  const limit = Number(body.limit);
+  if (!B.isNonNegNumber(limit)) throw new HttpError(422, 'VALIDATION', '额度组上限必须为非负数值', { field: 'limit' });
+  const note = typeof body.note === 'string' ? body.note.trim().slice(0, 200) : '';
+
+  if (body.members != null && !Array.isArray(body.members)) {
+    throw new HttpError(422, 'GROUP_INVALID', '额度组保存已拒绝：members 必须为作品编号数组', {
+      memberErrors: ['members 必须为作品编号数组'],
+    });
+  }
+  const rawMembers = Array.isArray(body.members) ? body.members : [];
+  const memberErrors = [];
+  const memberIds = [];
+  const seen = new Set();
+  rawMembers.forEach((x, i) => {
+    const where = () => `第 ${i + 1} 个成员`;
+    const n = Number(x);
+    if (!Number.isInteger(n) || n <= 0) {
+      memberErrors.push(`${where()}「${x}」不是合法作品编号`);
+      return;
+    }
+    const art = db.prepare('SELECT id, name, group_id FROM artworks WHERE id = ?').get(n);
+    if (!art) {
+      memberErrors.push(`${where()}：作品 #${n} 不存在`);
+      return;
+    }
+    if (seen.has(n)) {
+      memberErrors.push(`${where()}：作品「${art.name}」(#${n}) 在成员列表中重复`);
+      return;
+    }
+    if (art.group_id != null && art.group_id !== selfId) {
+      const g = db.prepare('SELECT name FROM budget_groups WHERE id = ?').get(art.group_id);
+      memberErrors.push(`${where()}：作品「${art.name}」(#${n}) 已归属额度组「${g ? g.name : `#${art.group_id}`}」，每件作品至多归属一组`);
+      return;
+    }
+    seen.add(n);
+    memberIds.push(n);
+  });
+  if (memberErrors.length) {
+    throw new HttpError(422, 'GROUP_INVALID', '额度组保存已拒绝：成员存在重复、不存在或已归属其他组', {
+      memberErrors,
+    });
+  }
+  return { name, limit, note, memberIds };
+}
+
+function createGroup(db, body) {
+  requireVersion(db, body);
+  const d = validateGroup(body, db);
+  const tx = db.transaction(() => {
+    const gid = db.prepare('INSERT INTO budget_groups (name, limit_amount, note) VALUES (?, ?, ?)')
+      .run(d.name, d.limit, d.note).lastInsertRowid;
+    const setMember = db.prepare('UPDATE artworks SET group_id = ? WHERE id = ?');
+    d.memberIds.forEach((aid) => setMember.run(gid, aid));
+    B.recomputeBlocked(db);
+    B.bumpVersion(db);
+    return B.summarize(db);
+  });
+  return tx.immediate();
+}
+
+function updateGroup(db, id, body) {
+  requireVersion(db, body);
+  // 校验在事务外读取当前归属；通过后在事务内整组替换成员集合
+  const d = validateGroup(body, db, id);
+  const tx = db.transaction(() => {
+    const exists = db.prepare('SELECT id FROM budget_groups WHERE id = ?').get(id);
+    if (!exists) throw new HttpError(404, 'NOT_FOUND', `额度组 #${id} 不存在`);
+    db.prepare('UPDATE budget_groups SET name = ?, limit_amount = ?, note = ? WHERE id = ?')
+      .run(d.name, d.limit, d.note, id);
+    // 整组替换：先解除原成员（含本次被移出的），再挂载新成员
+    db.prepare('UPDATE artworks SET group_id = NULL WHERE group_id = ?').run(id);
+    const setMember = db.prepare('UPDATE artworks SET group_id = ? WHERE id = ?');
+    d.memberIds.forEach((aid) => setMember.run(id, aid));
+    // 上限调整或成员变更后按现有时序重算余额与不可启动时段；
+    // 上限低于已用量时历史与进行中状态保留，仅阻断后续启动（由 recomputeBlocked 体现缺口）。
+    B.recomputeBlocked(db);
+    B.bumpVersion(db);
+    return B.summarize(db);
+  });
+  return tx.immediate();
+}
+
+function deleteGroup(db, id, body) {
+  requireVersion(db, body);
+  const tx = db.transaction(() => {
+    const r = db.prepare('DELETE FROM budget_groups WHERE id = ?').run(id);
+    if (r.changes === 0) throw new HttpError(404, 'NOT_FOUND', `额度组 #${id} 不存在`);
+    // 成员作品的 group_id 由外键 ON DELETE SET NULL 自动解除
+    B.recomputeBlocked(db);
+    B.bumpVersion(db);
+    return B.summarize(db);
+  });
+  return tx.immediate();
+}
+
 // ---------- 排期整批调整 ----------
 function describeSlot(s) {
   return {
@@ -235,7 +341,7 @@ function replaceSchedule(db, body) {
     });
   }
 
-  // 2) 预算：既有 + 进行中预占 + 本批未开始预占 <= 上限
+  // 2) 预算：既有 + 进行中预占 + 本批未开始预占 <= 上限（单件与额度组两层都须满足）
   const used = new Map(artworks.map((a) => [a.id, a.existing_amount]));
   for (const f of frozen) {
     for (const aid of f.artworkIds) {
@@ -245,16 +351,17 @@ function replaceSchedule(db, body) {
     }
   }
 
-  const budgetExceeded = [];
   const needByArt = new Map(artworks.map((a) => [a.id, 0]));
   for (const p of proposed) {
     const expo = B.round3((p.endMin - p.startMin) * p.lux);
     for (const aid of p.artworkIds) needByArt.set(aid, (needByArt.get(aid) || 0) + expo);
   }
+  const budgetExceeded = [];
   for (const a of artworks) {
     const projected = B.round3(used.get(a.id) + needByArt.get(a.id));
     if (projected > a.limit_amount + 1e-9) {
       budgetExceeded.push({
+        scope: 'artwork',
         artworkId: a.id,
         artworkName: a.name,
         limit: a.limit_amount,
@@ -264,9 +371,51 @@ function replaceSchedule(db, body) {
       });
     }
   }
-  if (budgetExceeded.length) {
-    throw new HttpError(422, 'BATCH_REJECTED', '整批已拒绝：有作品预占后将超过展期上限', {
+
+  // 额度组：组基线（成员既有 + 已结束实际 + 进行中冻结）+ 本批各成员未开始预占之和 <= 组上限。
+  // 同一时段含同组多件作品时逐件计入（needByArt 已按件累加，无需额外处理）。
+  const groups = B.loadGroups(db);
+  const membersByGroup = new Map(groups.map((g) => [g.id, []]));
+  for (const a of artworks) if (a.group_id != null && membersByGroup.has(a.group_id)) membersByGroup.get(a.group_id).push(a);
+  const groupBudgetExceeded = [];
+  for (const g of groups) {
+    let base = 0, need = 0;
+    const contributions = [];
+    for (const a of membersByGroup.get(g.id) || []) {
+      const mUsed = B.round3(used.get(a.id));
+      const mNeed = B.round3(needByArt.get(a.id) || 0);
+      base += mUsed;
+      need += mNeed;
+      if (mNeed > 0) {
+        contributions.push({
+          artworkId: a.id, artworkName: a.name,
+          used: mUsed, scheduledNeed: mNeed,
+          projected: B.round3(mUsed + mNeed),
+        });
+      }
+    }
+    base = B.round3(base);
+    need = B.round3(need);
+    const projected = B.round3(base + need);
+    if (projected > g.limit_amount + 1e-9) {
+      contributions.sort((x, y) => y.scheduledNeed - x.scheduledNeed || x.artworkId - y.artworkId);
+      groupBudgetExceeded.push({
+        scope: 'group',
+        groupId: g.id,
+        groupName: g.name,
+        limit: g.limit_amount,
+        used: base,
+        scheduledNeed: need,
+        projected,
+        overflow: B.round3(projected - g.limit_amount),
+        contributions,
+      });
+    }
+  }
+  if (budgetExceeded.length || groupBudgetExceeded.length) {
+    throw new HttpError(422, 'BATCH_REJECTED', '整批已拒绝：有作品或额度组预占后将超过上限', {
       budgetExceeded,
+      groupBudgetExceeded,
     });
   }
 
@@ -529,6 +678,7 @@ function localNowString() {
 module.exports = {
   HttpError, readBody, parseId,
   createArtwork, updateArtwork, deleteArtwork,
+  createGroup, updateGroup, deleteGroup,
   replaceSchedule, startSlot, finishSlot,
   settleSlotSegments, correctSlot,
 };

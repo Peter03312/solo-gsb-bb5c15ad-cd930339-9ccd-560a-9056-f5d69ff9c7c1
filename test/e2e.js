@@ -367,6 +367,127 @@ const getState = async () => (await call('GET', '/api/state')).json;
      && st.slots.find((s) => s.id === 1).actualExposure === 22400,
      '初始已结束时段为多段结算（2 段、合计 22400）并带更正记录');
 
+  console.log('# 17. 共享额度组：成员校验（重复/不存在/跨组/非负上限）');
+  st = await getState();
+  v = st.version;
+  // 两件独立作品，单件上限很大，避免与单件约束耦合
+  r = await call('POST', '/api/artworks', { version: v, name: '组测品A', limit: 1000000, existing: 60000 });
+  ok(r.status === 200, '组测品 A（既有 60000）已创建');
+  const ga = r.json.artworks.at(-1).id;
+  v = r.json.version;
+  r = await call('POST', '/api/artworks', { version: v, name: '组测品B', limit: 1000000, existing: 0 });
+  ok(r.status === 200, '组测品 B 已创建');
+  const gb = r.json.artworks.at(-1).id;
+  v = r.json.version;
+
+  // 成员重复
+  r = await call('POST', '/api/groups', { version: v, name: '组测组X', limit: 100000, members: [ga, ga] });
+  ok(r.status === 422 && r.json.error.code === 'GROUP_INVALID'
+     && r.json.memberErrors.some((m) => m.includes('重复')), '成员列表重复被拒绝');
+  // 成员不存在
+  r = await call('POST', '/api/groups', { version: v, name: '组测组X', limit: 100000, members: [99999] });
+  ok(r.status === 422 && r.json.memberErrors.some((m) => m.includes('不存在')), '不存在成员被拒绝');
+  // 负上限 / 空名
+  r = await call('POST', '/api/groups', { version: v, name: '组测组X', limit: -1, members: [] });
+  ok(r.status === 422 && r.json.error.code === 'VALIDATION', '组负上限被拒绝');
+  st = await getState();
+  ok(st.version === v, '组校验失败不改版本与记录');
+
+  // 先建含 A 的组，再把 A 放进第二个组 → 跨组冲突
+  r = await call('POST', '/api/groups', { version: v, name: '组测组-含A', limit: 100000, members: [ga] });
+  ok(r.status === 200, '第一个组（含 A）创建成功');
+  const gOther = r.json.groups.find((x) => x.name === '组测组-含A').id;
+  v = r.json.version;
+  r = await call('POST', '/api/groups', { version: v, name: '组测组-再含A', limit: 100000, members: [ga, gb] });
+  ok(r.status === 422 && r.json.memberErrors.some((m) => m.includes('至多归属一组')), '同一作品跨组被拒绝');
+  // 组名重复
+  r = await call('POST', '/api/groups', { version: v, name: '组测组-含A', limit: 1, members: [] });
+  ok(r.status === 422, '额度组名称重复被拒绝');
+  // 过期版本
+  r = await call('POST', '/api/groups', { version: 1, name: '组测过期', limit: 1, members: [] });
+  ok(r.status === 409 && r.json.error.code === 'VERSION_STALE' && r.json.state.version === v, '组创建过期版本 409 返回最新预算');
+
+  console.log('# 18. 额度组整批校验：同槽多件逐件计入，拒绝时给出组/成员贡献/超额量');
+  // 把第一个组改成含 A、B，上限 150000
+  r = await call('PUT', `/api/groups/${gOther}`, { version: v, name: '组测组-含A', limit: 150000, members: [ga, gb] });
+  ok(r.status === 200, '组更新为含 A、B（B 原无组，合法）');
+  v = r.json.version;
+  // 同一时段 A+B，60 分 × 500 = 30000/件：已用 60000 + 组占用 60000 = 120000 <= 150000 → 通过
+  r = await call('POST', '/api/schedule', { version: v, slots: [
+    { cid: 'gok', hall: '组厅', start: '2026-12-10T10:00', end: '2026-12-10T11:00', lux: 500, artworkIds: [ga, gb] },
+  ]});
+  ok(r.status === 200, '同槽两件组内作品：组占用按两件计 60000，已用+占用 120000 未超组上限，保存成功');
+  v = r.json.version;
+  // 60 分 × 1000 = 60000/件，组占用 120000，60000+120000=180000 > 150000，超额 30000 → 整批拒绝
+  r = await call('POST', '/api/schedule', { version: v, slots: [
+    { cid: 'gbig', hall: '组厅', start: '2026-12-10T10:00', end: '2026-12-10T11:00', lux: 1000, artworkIds: [ga, gb] },
+  ]});
+  ok(r.status === 422 && r.json.error.code === 'BATCH_REJECTED' && r.json.groupBudgetExceeded?.length === 1,
+     `组超量整批拒绝（code=${r.json.error?.code}）`);
+  const ge = r.json.groupBudgetExceeded?.[0];
+  ok(ge && ge.groupId === gOther && ge.overflow === 30000 && ge.scheduledNeed === 120000
+     && ge.projected === 180000 && ge.used === 60000
+     && ge.contributions.length === 2
+     && ge.contributions.every((c) => c.scheduledNeed === 60000),
+     `拒绝明细含组、成员贡献（各 60000）与超额量 ${ge?.overflow}（应 30000）`);
+  st = await getState();
+  ok(st.version === v, '组超量拒绝后版本与记录不变');
+
+  console.log('# 19. 组上限低于已用量：保留历史/进行中，仅阻断后续启动并展示缺口');
+  // 组上限恢复 100000，保存一个仅含 A 的未开始时段：60 分 × 100 = 6000，已用 60000 + 6000 = 66000
+  r = await call('PUT', `/api/groups/${gOther}`, { version: v, name: '组测组-含A', limit: 100000, members: [ga, gb] });
+  ok(r.status === 200, '组上限恢复为 100000');
+  v = r.json.version;
+  r = await call('POST', '/api/schedule', { version: v, slots: [
+    { cid: 'gsmall', hall: '组厅', start: '2026-12-11T10:00', end: '2026-12-11T11:00', lux: 100, artworkIds: [ga] },
+  ]});
+  ok(r.status === 200, '组上限充足时小时段保存成功');
+  v = r.json.version;
+  const gSlot = r.json.slots.find((s) => s.plannedStart.startsWith('2026-12-11'));
+  ok(!gSlot.blocked, '降额前时段可启动');
+  // 组上限降到 50000（低于 A 既有已用 60000）
+  r = await call('PUT', `/api/groups/${gOther}`, { version: v, name: '组测组-含A', limit: 50000, members: [ga, gb] });
+  ok(r.status === 200, '上限低于已用量仍允许调整配置');
+  v = r.json.version;
+  const gAfter = r.json.groups.find((x) => x.id === gOther);
+  ok(gAfter.over === true && gAfter.balance === -16000 && gAfter.used === 60000,
+     `组余额为负 ${gAfter?.balance}（应 -16000），已用历史保留 ${gAfter?.used}`);
+  const blockedSlot = r.json.slots.find((s) => s.id === gSlot.id);
+  ok(blockedSlot.blocked && blockedSlot.blockedReason.groupGaps[0].gap === 16000
+     && blockedSlot.blockedReason.groupGaps[0].has === -10000,
+     `未开始时段被标不可启动，组缺口 ${blockedSlot?.blockedReason?.groupGaps?.[0]?.gap}（应 16000）、可用 ${blockedSlot?.blockedReason?.groupGaps?.[0]?.has}（应 -10000）`);
+  r = await call('POST', `/api/slots/${gSlot.id}/start`);
+  ok(r.status === 422 && r.json.error.code === 'BLOCKED'
+     && r.json.blockedReason.groupGaps[0].groupId === gOther, '缺口时段启动被 422 阻断');
+  // 组上限恢复后缺口消除、可以启动
+  r = await call('PUT', `/api/groups/${gOther}`, { version: v, name: '组测组-含A', limit: 100000, members: [ga, gb] });
+  ok(r.status === 200, '组上限恢复');
+  v = r.json.version;
+  ok(!r.json.slots.find((s) => s.id === gSlot.id).blocked, '恢复上限后时段重新可启动');
+  r = await call('POST', `/api/slots/${gSlot.id}/start`);
+  ok(r.status === 200, '恢复后时段启动成功（进行中）');
+  v = r.json.version;
+  // 进行中：再把组上限压到极低，进行中状态保留（不标 blocked），仅余额为负
+  r = await call('PUT', `/api/groups/${gOther}`, { version: v, name: '组测组-含A', limit: 1000, members: [ga, gb] });
+  ok(r.status === 200 && r.json.slots.find((s) => s.id === gSlot.id).status === 'running'
+     && !r.json.slots.find((s) => s.id === gSlot.id).blocked
+     && r.json.groups.find((x) => x.id === gOther).over === true,
+     '上限压至已用量以下：进行中时段保留运行、不标不可启动，仅组余额显示缺口');
+  v = r.json.version;
+
+  console.log('# 20. 额度组删除：解除成员归属并重算；GET /api/state 含 groups');
+  st = await getState();
+  ok(Array.isArray(st.groups) && st.groups.some((x) => x.id === gOther)
+     && st.artworks.find((a) => a.id === ga).groupId === gOther,
+     'state 携带 groups，作品 DTO 携带 groupId/groupName');
+  r = await call('DELETE', `/api/groups/${gOther}`, { version: v });
+  ok(r.status === 200 && !r.json.groups.some((x) => x.id === gOther)
+     && r.json.artworks.find((a) => a.id === ga).groupId === null
+     && r.json.artworks.find((a) => a.id === gb).groupId === null,
+     '删除组后成员解除归属（单件预算与时段历史保留）');
+  r = await call('DELETE', `/api/groups/${gOther}`, { version: r.json.version });
+  ok(r.status === 404, '重复删除返回 404');
+
   console.log(`\n结果：${pass} 通过，${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

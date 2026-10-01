@@ -20,6 +20,14 @@ function seed(db) {
   artIds.w2 = insArt.run('《星夜手稿》水彩', 100000, 20000, '').lastInsertRowid;
   artIds.w3 = insArt.run('《青铜纹样》摄影', 120000, 30000, '耐照度较高').lastInsertRowid;
 
+  // 共享曝光额度组：两件易损作品共用一笔额度（每件仍保留各自单件上限）。
+  // 初始已用 32000（既有 12000+20000），组上限取充裕值 260000，初始排期全部可启动；
+  // 将上限调低（如低于成员已用之和）即可演示组预算阻断与缺口展示。
+  const groupId = db.prepare(
+    'INSERT INTO budget_groups (name, limit_amount, note) VALUES (?, ?, ?)'
+  ).run('纸本/水彩易损作品共享额度', 260000, '山水轴与星夜手稿巡展共用曝光额度').lastInsertRowid;
+  db.prepare('UPDATE artworks SET group_id = ? WHERE id IN (?, ?)').run(groupId, artIds.w1, artIds.w2);
+
   const insSlot = db.prepare(`
     INSERT INTO slots (hall, seq, status, planned_start, planned_end, planned_lux,
                        actual_start, actual_end, actual_lux, actual_exposure, blocked, blocked_reason)

@@ -16,13 +16,22 @@ CREATE TABLE IF NOT EXISTS meta (
   version INTEGER NOT NULL DEFAULT 1
 );
 
+-- 共享曝光额度组：若干易损作品共用一笔非负上限（每件作品至多归属一组）
+CREATE TABLE IF NOT EXISTS budget_groups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  limit_amount REAL NOT NULL CHECK (limit_amount >= 0),
+  note TEXT NOT NULL DEFAULT ''
+);
+
 -- 作品：展期曝光上限（lux·min）与既有累计量
 CREATE TABLE IF NOT EXISTS artworks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL UNIQUE,
   limit_amount REAL NOT NULL CHECK (limit_amount >= 0),
   existing_amount REAL NOT NULL CHECK (existing_amount >= 0),
-  note TEXT NOT NULL DEFAULT ''
+  note TEXT NOT NULL DEFAULT '',
+  group_id INTEGER REFERENCES budget_groups(id) ON DELETE SET NULL
 );
 
 -- 展厅时段
@@ -76,9 +85,10 @@ CREATE TABLE IF NOT EXISTS slot_artworks (
 );
 `;
 
-// 旧库升级：为已存在的 slots 表补齐多段结算列
+// 旧库升级：为已存在的表补齐新增列
 const MIGRATIONS = [
   `ALTER TABLE slots ADD COLUMN actual_segments TEXT NOT NULL DEFAULT '[]'`,
+  `ALTER TABLE artworks ADD COLUMN group_id INTEGER REFERENCES budget_groups(id) ON DELETE SET NULL`,
 ];
 
 function openDb() {
@@ -90,9 +100,15 @@ function openDb() {
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
   for (const sql of MIGRATIONS) {
-    const hasCol = db.prepare("PRAGMA table_info(slots)").all()
-      .some((c) => c.name === 'actual_segments');
-    if (!hasCol) db.exec(sql);
+    if (sql.includes('actual_segments')) {
+      const hasCol = db.prepare("PRAGMA table_info(slots)").all()
+        .some((c) => c.name === 'actual_segments');
+      if (!hasCol) db.exec(sql);
+    } else if (sql.includes('group_id')) {
+      const hasCol = db.prepare("PRAGMA table_info(artworks)").all()
+        .some((c) => c.name === 'group_id');
+      if (!hasCol) db.exec(sql);
+    }
   }
   return db;
 }

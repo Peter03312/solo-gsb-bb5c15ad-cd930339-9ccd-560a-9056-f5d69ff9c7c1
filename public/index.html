@@ -24,6 +24,32 @@
   <main>
     <div id="toast" class="toast hidden"></div>
 
+    <!-- 共享曝光额度组 -->
+    <section class="card">
+      <div class="card-head">
+        <h2>共享曝光额度组</h2>
+        <div class="hint">易损作品共用一笔额度：已用 = 成员既有累计 + 已结束实际曝光；预占 = 成员进行中冻结 + 未开始计划（同一时段多件组内作品逐件计入）。单件与组上限须同时满足；上限低于已用量时保留历史与进行中，仅阻断后续启动</div>
+        <button class="btn btn-primary" id="addGroupBtn">＋ 新建额度组</button>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table" id="groupTable">
+          <thead>
+            <tr>
+              <th>额度组</th>
+              <th class="num">组上限</th>
+              <th class="num">已用</th>
+              <th class="num">预占<span class="th-sub">进行中 / 未开始</span></th>
+              <th class="num">已用+预占</th>
+              <th class="num">组余额</th>
+              <th>成员（单件已用+预占）</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
     <!-- 作品预算 -->
     <section class="card">
       <div class="card-head">
@@ -36,6 +62,7 @@
           <thead>
             <tr>
               <th>作品</th>
+              <th>所属额度组</th>
               <th class="num">展期上限</th>
               <th class="num">既有累计</th>
               <th class="num">已用</th>
@@ -112,6 +139,26 @@
       <div class="modal-actions">
         <button class="btn" data-close>取消</button>
         <button class="btn btn-primary" id="aw_save">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 额度组弹窗 -->
+  <div class="modal-mask hidden" id="groupModal">
+    <div class="modal">
+      <h3 id="groupModalTitle">新建额度组</h3>
+      <div class="form-row"><label>额度组名称</label><input type="text" id="gp_name" maxlength="100" /></div>
+      <div class="form-row"><label>共享曝光上限（lux·min）</label><input type="number" id="gp_limit" min="0" step="1" /></div>
+      <div class="form-row"><label>备注</label><input type="text" id="gp_note" maxlength="200" /></div>
+      <div class="form-row gp-members-row">
+        <label>成员作品（每件至多归属一组）</label>
+        <select id="gp_members" multiple size="6"></select>
+      </div>
+      <div class="gp-preview hint" id="gp_preview"></div>
+      <div class="form-error hidden" id="gp_error"></div>
+      <div class="modal-actions">
+        <button class="btn" data-close>取消</button>
+        <button class="btn btn-primary" id="gp_save">保存</button>
       </div>
     </div>
   </div>
