@@ -74,6 +74,21 @@ CREATE TABLE IF NOT EXISTS slot_artworks (
   artwork_id INTEGER NOT NULL REFERENCES artworks(id) ON DELETE CASCADE,
   PRIMARY KEY (slot_id, artwork_id)
 );
+
+-- 曝光额度组：巡展中易损作品共用一笔曝光额度（名称 + 非负上限）
+CREATE TABLE IF NOT EXISTS quota_groups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  limit_amount REAL NOT NULL CHECK (limit_amount >= 0)
+);
+
+-- 额度组成员：每件作品至多归属一组（artwork_id 唯一索引保证）
+CREATE TABLE IF NOT EXISTS quota_group_members (
+  group_id INTEGER NOT NULL REFERENCES quota_groups(id) ON DELETE CASCADE,
+  artwork_id INTEGER NOT NULL REFERENCES artworks(id) ON DELETE CASCADE,
+  PRIMARY KEY (group_id, artwork_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_quota_group_members_artwork ON quota_group_members(artwork_id);
 `;
 
 // 旧库升级：为已存在的 slots 表补齐多段结算列

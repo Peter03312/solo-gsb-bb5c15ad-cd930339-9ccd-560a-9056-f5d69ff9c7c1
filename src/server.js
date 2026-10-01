@@ -82,6 +82,17 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'DELETE') return sendJson(res, 200, H.deleteArtwork(db, id, body));
     }
 
+    // 曝光额度组
+    if (req.method === 'POST' && pathname === '/api/groups') {
+      return sendJson(res, 200, H.createGroup(db, body));
+    }
+    const mGrp = pathname.match(/^\/api\/groups\/(\d+)$/);
+    if (mGrp) {
+      const id = H.parseId(mGrp[1]);
+      if (req.method === 'PUT') return sendJson(res, 200, H.updateGroup(db, id, body));
+      if (req.method === 'DELETE') return sendJson(res, 200, H.deleteGroup(db, id, body));
+    }
+
     // 排期：整批调整（替换全部未开始时段）
     if (req.method === 'POST' && pathname === '/api/schedule') {
       return sendJson(res, 200, H.replaceSchedule(db, body));
@@ -106,6 +117,7 @@ const server = http.createServer(async (req, res) => {
       if (err.errors) payload.errors = err.errors;
       if (err.conflicts) payload.conflicts = err.conflicts;
       if (err.budgetExceeded) payload.budgetExceeded = err.budgetExceeded;
+      if (err.groupExceeded) payload.groupExceeded = err.groupExceeded;
       if (err.blockedReason) payload.blockedReason = err.blockedReason;
       if (err.segmentErrors) payload.segmentErrors = err.segmentErrors;
       return sendJson(res, err.status, payload);

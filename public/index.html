@@ -43,6 +43,33 @@
               <th class="num">已用+预占</th>
               <th class="num">余额</th>
               <th>备注</th>
+              <th>额度组</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 曝光额度组 -->
+    <section class="card">
+      <div class="card-head">
+        <h2>曝光额度组</h2>
+        <div class="hint">易损作品共用一笔曝光额度：组已用 = 成员既有累计 + 已结束实际曝光；预占 = 进行中（冻结）+ 未开始；同一时段多件组内作品逐件计入；每件作品至多归属一组</div>
+        <button class="btn btn-primary" id="addGroupBtn">＋ 新建额度组</button>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table" id="groupTable">
+          <thead>
+            <tr>
+              <th>额度组</th>
+              <th>成员作品</th>
+              <th class="num">组上限</th>
+              <th class="num">已用</th>
+              <th class="num">预占<span class="th-sub">进行中 / 未开始</span></th>
+              <th class="num">已用+预占</th>
+              <th class="num">余额</th>
               <th>操作</th>
             </tr>
           </thead>
@@ -112,6 +139,24 @@
       <div class="modal-actions">
         <button class="btn" data-close>取消</button>
         <button class="btn btn-primary" id="aw_save">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 额度组弹窗 -->
+  <div class="modal-mask hidden" id="groupModal">
+    <div class="modal">
+      <h3 id="groupModalTitle">新建额度组</h3>
+      <div class="form-row"><label>组名称</label><input type="text" id="gr_name" maxlength="100" /></div>
+      <div class="form-row"><label>组曝光上限（lux·min）</label><input type="number" id="gr_limit" min="0" step="1" /></div>
+      <div class="form-row">
+        <label>成员作品（每件作品至多归属一组）</label>
+        <select multiple id="gr_members" size="5"></select>
+      </div>
+      <div class="form-error hidden" id="gr_error"></div>
+      <div class="modal-actions">
+        <button class="btn" data-close>取消</button>
+        <button class="btn btn-primary" id="gr_save">保存</button>
       </div>
     </div>
   </div>

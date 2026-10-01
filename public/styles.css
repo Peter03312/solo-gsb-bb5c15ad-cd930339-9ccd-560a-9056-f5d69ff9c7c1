@@ -166,6 +166,7 @@ td.cell-expo { font-family: var(--mono); font-size: 12.5px; white-space: nowrap;
 .form-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
 .form-row label { width: 170px; color: var(--muted); font-size: 13px; flex-shrink: 0; }
 .form-row input { flex: 1; min-width: 0; }
+.form-row select { flex: 1; min-width: 0; }
 .form-row.computed { justify-content: flex-end; font-size: 13px; color: var(--muted); }
 .form-row.computed strong { color: var(--primary); font-family: var(--mono); font-size: 15px; }
 

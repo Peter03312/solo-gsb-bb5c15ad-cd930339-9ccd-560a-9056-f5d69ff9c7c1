@@ -91,6 +91,14 @@ function seed(db) {
   }).lastInsertRowid;
   addLinks(s5, [artIds.w3]);
 
+  // 额度组演示：两件纸本易损作品共用一笔曝光额度（上限宽裕，不影响既有演示流程；
+  // 把组上限调低到 200000 以下即可体验组维度阻断）
+  const g1 = db.prepare('INSERT INTO quota_groups (name, limit_amount) VALUES (?, ?)')
+    .run('纸本联展共用额度', 300000).lastInsertRowid;
+  const insMem = db.prepare('INSERT INTO quota_group_members (group_id, artwork_id) VALUES (?, ?)');
+  insMem.run(g1, artIds.w1);
+  insMem.run(g1, artIds.w2);
+
   const tx = db.transaction(() => recomputeBlocked(db));
   tx.immediate();
   return true;

@@ -1,10 +1,11 @@
 'use strict';
 
 const $ = (sel) => document.querySelector(sel);
-let state = { version: null, artworks: [], slots: [] };
+let state = { version: null, artworks: [], groups: [], slots: [] };
 let draft = [];          // 未开始时段草稿
 let draftSeq = 0;        // 草稿行本地序号
 let editingArtworkId = null;
+let editingGroupId = null;
 let finishingSlotId = null;
 let correctingSlotId = null;
 let fnSegments = [];     // 结束弹窗分段编辑数据
@@ -82,13 +83,18 @@ function newDraftRow() {
 }
 
 // ---------- 渲染：作品 ----------
+function groupOfArtwork(aid) {
+  return (state.groups || []).find((g) => g.members.some((m) => m.id === aid)) || null;
+}
 function renderArtworks() {
   const tb = $('#artworkTable tbody');
   if (!state.artworks.length) {
-    tb.innerHTML = '<tr class="empty-row"><td colspan="9">还没有作品，点击「录入作品」开始</td></tr>';
+    tb.innerHTML = '<tr class="empty-row"><td colspan="10">还没有作品，点击「录入作品」开始</td></tr>';
     return;
   }
-  tb.innerHTML = state.artworks.map((a) => `
+  tb.innerHTML = state.artworks.map((a) => {
+    const g = groupOfArtwork(a.id);
+    return `
     <tr>
       <td class="art-name">${esc(a.name)}</td>
       <td class="num">${fmt(a.limit)}</td>
@@ -98,14 +104,62 @@ function renderArtworks() {
       <td class="num">${fmt(a.committed)}</td>
       <td class="num ${a.over ? 'neg' : 'pos'}">${a.over ? '−' + fmt(Math.abs(a.balance)) : fmt(a.balance)}</td>
       <td class="note-text">${esc(a.note)}</td>
+      <td>${g ? `<span class="chip">${esc(g.name)}</span>` : '—'}</td>
       <td>
         <div class="row-actions">
           <button class="btn btn-sm" data-act="edit-art" data-id="${a.id}">编辑</button>
           <button class="btn btn-sm btn-danger" data-act="del-art" data-id="${a.id}">删除</button>
         </div>
       </td>
+    </tr>`;
+  }).join('');
+}
+
+// ---------- 渲染：曝光额度组 ----------
+function renderGroups() {
+  const tb = $('#groupTable tbody');
+  const groups = state.groups || [];
+  if (!groups.length) {
+    tb.innerHTML = '<tr class="empty-row"><td colspan="8">还没有额度组，点击「新建额度组」让易损作品共用一笔曝光额度</td></tr>';
+    return;
+  }
+  tb.innerHTML = groups.map((g) => `
+    <tr>
+      <td class="art-name">${esc(g.name)}</td>
+      <td><div class="art-chips">${g.members.length
+        ? g.members.map((m) => `<span class="chip">${esc(m.name)}</span>`).join('')
+        : '<span style="color:var(--muted);font-size:12px">暂无成员</span>'}</div></td>
+      <td class="num">${fmt(g.limit)}</td>
+      <td class="num">${fmt(g.used)}</td>
+      <td class="num">${fmt(g.reserved)}<span class="reserved-detail">${fmt(g.reservedRunning)} / ${fmt(g.reservedScheduled)}</span></td>
+      <td class="num">${fmt(g.committed)}</td>
+      <td class="num ${g.over ? 'neg' : 'pos'}">${g.over ? '−' + fmt(Math.abs(g.balance)) : fmt(g.balance)}</td>
+      <td>
+        <div class="row-actions">
+          <button class="btn btn-sm" data-act="edit-group" data-id="${g.id}">编辑</button>
+          <button class="btn btn-sm btn-danger" data-act="del-group" data-id="${g.id}">删除</button>
+        </div>
+      </td>
     </tr>
   `).join('');
+}
+
+// ---------- 阻断原因（单件缺口 + 组缺口） ----------
+function gapItems(reason) {
+  const items = [];
+  ((reason && reason.gaps) || []).forEach((g) => items.push(
+    `作品「${esc(g.artworkName)}」：当前可用余额 ${fmt(g.has)}，本时段需要 ${fmt(g.need)}，缺口 <strong>${fmt(g.gap)}</strong> lux·min`));
+  ((reason && reason.groupGaps) || []).forEach((g) => items.push(
+    `额度组「${esc(g.groupName)}」：组可用余额 ${fmt(g.has)}，本时段需要 ${fmt(g.need)}（${g.memberCount} 件成员逐件计入），缺口 <strong>${fmt(g.gap)}</strong> lux·min`));
+  return items;
+}
+function gapText(reason) {
+  const parts = [];
+  ((reason && reason.gaps) || []).forEach((g) =>
+    parts.push(`「${g.artworkName}」缺口 ${fmt(g.gap)}（可用 ${fmt(g.has)} / 需 ${fmt(g.need)}）`));
+  ((reason && reason.groupGaps) || []).forEach((g) =>
+    parts.push(`额度组「${g.groupName}」缺口 ${fmt(g.gap)}（组可用 ${fmt(g.has)} / 需 ${fmt(g.need)}）`));
+  return parts.join('；');
 }
 
 // ---------- 渲染：冻结时段（进行中/已结束） ----------
@@ -197,13 +251,13 @@ function renderDraft() {
   tb.innerHTML = draft.map((r) => {
     const mins = minutes(r.start, r.end);
     const expo = mins !== null && mins >= 0 && Number(r.lux) >= 0 ? Math.round(mins * Number(r.lux)) : null;
-    const gaps = (r.blockedReason && r.blockedReason.gaps) || [];
-    const gapHtml = gaps.length ? `
+    const items = gapItems(r.blockedReason);
+    const gapHtml = items.length ? `
       <tr class="blocked-tag-row">
         <td colspan="8" class="blocked-cell">
           <strong>⛔ 预算不足，禁止启动。</strong> 调整排期后重新核算。
           <ul class="gap-list">
-            ${gaps.map((g) => `<li>作品「${esc(g.artworkName)}」：当前可用余额 ${fmt(g.has)}，本时段需要 ${fmt(g.need)}，缺口 <strong>${fmt(g.gap)}</strong> lux·min</li>`).join('')}
+            ${items.map((t) => `<li>${t}</li>`).join('')}
           </ul>
         </td>
       </tr>` : '';
@@ -230,6 +284,7 @@ function renderDraft() {
 
 function renderAll() {
   renderArtworks();
+  renderGroups();
   renderFrozen();
   renderDraft();
 }
@@ -294,6 +349,10 @@ function formatBatchError(payload) {
   (payload.budgetExceeded || []).forEach((b) => {
     lines.push(`• 作品「${b.artworkName}」预算超限：已用 ${fmt(b.used)} + 预占 = ${fmt(b.projected)}，上限 ${fmt(b.limit)}，超出 ${fmt(b.overflow)} lux·min`);
   });
+  (payload.groupExceeded || []).forEach((g) => {
+    lines.push(`• 额度组「${g.groupName}」共用额度超限：已用 ${fmt(g.used)} + 本批预占 ${fmt(g.batchNeed)} = ${fmt(g.projected)}，组上限 ${fmt(g.limit)}，超出 ${fmt(g.overflow)} lux·min`);
+    (g.members || []).forEach((m) => lines.push(`    成员「${m.artworkName}」贡献 ${fmt(m.contribution)} lux·min`));
+  });
   (payload.segmentErrors || []).forEach((x) => lines.push(`• ${x}`));
   return lines.join('\n') || '整批校验失败';
 }
@@ -314,11 +373,8 @@ $('#saveScheduleBtn').addEventListener('click', async () => {
     applyNewState(next);
     const blocked = next.slots.filter((s) => s.blocked);
     if (blocked.length) {
-      const detail = blocked.map((s) => {
-        const gaps = (s.blockedReason.gaps || []).map((g) =>
-          `「${g.artworkName}」缺口 ${fmt(g.gap)}（可用 ${fmt(g.has)} / 需 ${fmt(g.need)}）`).join('；');
-        return `#${s.seq} ${s.hall} ${s.plannedStart}~${s.plannedEnd}：${gaps}`;
-      }).join('\n');
+      const detail = blocked.map((s) =>
+        `#${s.seq} ${s.hall} ${s.plannedStart}~${s.plannedEnd}：${gapText(s.blockedReason)}`).join('\n');
       toast('warn', `整批已保存并重新核算，以下时段按开始顺序不可启动：\n${detail}`);
     } else {
       toast('success', '整批校验通过，排期已保存');
@@ -335,9 +391,7 @@ async function startSlot(id) {
     toast('success', '时段已启动：原排期冻结，预占保留');
   } catch (err) {
     if (err.status === 422 && err.payload && err.payload.blockedReason) {
-      const gaps = (err.payload.blockedReason.gaps || []).map((g) =>
-        `「${g.artworkName}」缺口 ${fmt(g.gap)}（可用 ${fmt(g.has)} / 需 ${fmt(g.need)}）`).join('\n');
-      toast('error', `禁止启动：预算不足\n${gaps}\n请调整排期后重新核算`);
+      toast('error', `禁止启动：预算不足\n${gapText(err.payload.blockedReason)}\n请调整排期后重新核算`);
     } else {
       toast('error', err.message);
     }
@@ -523,11 +577,8 @@ $('#fn_save').addEventListener('click', async () => {
     applyNewState(next);
     const expo = next.justFinishedExposure;
     if (next.blockedAfterFinish && next.blockedAfterFinish.length) {
-      const detail = next.blockedAfterFinish.map((s) => {
-        const gaps = (s.blockedReason.gaps || []).map((g) =>
-          `「${g.artworkName}」缺口 ${fmt(g.gap)}（可用 ${fmt(g.has)} / 需 ${fmt(g.need)}）`).join('；');
-        return `#${s.seq} ${s.hall} ${s.plannedStart}~${s.plannedEnd}：${gaps}`;
-      }).join('\n');
+      const detail = next.blockedAfterFinish.map((s) =>
+        `#${s.seq} ${s.hall} ${s.plannedStart}~${s.plannedEnd}：${gapText(s.blockedReason)}`).join('\n');
       toast('warn', `已结算，实际曝光 ${fmt(expo)} lux·min 已替换预占。\n超量导致以下后续时段预算不足、不可开始：\n${detail}\n请调整排期后重新核算`);
     } else {
       toast('success', `已结束并补记，实际曝光 ${fmt(expo)} lux·min 已替换预占`);
@@ -589,11 +640,8 @@ $('#cr_save').addEventListener('click', async () => {
     const head = `已提交第 ${c.seqNo} 次更正：曝光 ${fmt(c.before.exposure)} → ${fmt(c.after.exposure)} lux·min`
       + (dir === 0 ? '（总量不变）' : dir > 0 ? `（+${fmt(dir)}）` : `（−${fmt(Math.abs(dir))}）`);
     if (next.blockedAfterFinish && next.blockedAfterFinish.length) {
-      const detail = next.blockedAfterFinish.map((s) => {
-        const gaps = (s.blockedReason.gaps || []).map((g) =>
-          `「${g.artworkName}」缺口 ${fmt(g.gap)}（可用 ${fmt(g.has)} / 需 ${fmt(g.need)}）`).join('；');
-        return `#${s.seq} ${s.hall}：${gaps}`;
-      }).join('\n');
+      const detail = next.blockedAfterFinish.map((s) =>
+        `#${s.seq} ${s.hall}：${gapText(s.blockedReason)}`).join('\n');
       toast('warn', `${head}\n新总量已替换旧总量并重算，以下后续时段不可启动：\n${detail}`);
     } else {
       toast('success', `${head}，已用量与后续可启动状态已同步重算`);
@@ -659,6 +707,70 @@ $('#aw_save').addEventListener('click', async () => {
   } catch (err) {
     if (err.status === 409) { $('#artworkModal').classList.add('hidden'); }
     await handleMutationError(err);
+  }
+});
+
+// ---------- 额度组弹窗 ----------
+function openGroupModal(g) {
+  editingGroupId = g ? g.id : null;
+  $('#groupModalTitle').textContent = g ? '编辑额度组' : '新建额度组';
+  $('#gr_name').value = g ? g.name : '';
+  $('#gr_limit').value = g ? g.limit : '';
+  // 成员选项：已归属其他组的作品禁用（服务端仍会再次校验）
+  const takenBy = new Map();
+  (state.groups || []).forEach((x) => {
+    if (g && x.id === g.id) return;
+    x.members.forEach((m) => takenBy.set(m.id, x.name));
+  });
+  const selected = g ? g.members.map((m) => m.id) : [];
+  $('#gr_members').innerHTML = state.artworks.map((a) => {
+    const taken = takenBy.get(a.id);
+    return `<option value="${a.id}" ${selected.includes(a.id) ? 'selected' : ''} ${taken ? 'disabled' : ''}>`
+      + `${esc(a.name)}${taken ? `（已在「${esc(taken)}」）` : ''}</option>`;
+  }).join('');
+  $('#gr_error').classList.add('hidden');
+  $('#groupModal').classList.remove('hidden');
+}
+$('#addGroupBtn').addEventListener('click', () => {
+  if (!state.artworks.length) return toast('warn', '请先录入至少一件作品');
+  openGroupModal(null);
+});
+
+$('#groupTable').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const id = Number(btn.dataset.id);
+  const g = (state.groups || []).find((x) => x.id === id);
+  if (!g) return;
+  if (btn.dataset.act === 'edit-group') openGroupModal(g);
+  if (btn.dataset.act === 'del-group') {
+    if (!confirm(`确定删除额度组「${g.name}」吗？成员作品与历史记录保留，仅解除共用额度。`)) return;
+    try {
+      const next = await api(`/api/groups/${id}`, { method: 'DELETE', body: { version: state.version } });
+      applyNewState(next);
+      toast('success', '额度组已删除，余额与不可启动时段已重算');
+    } catch (err) { await handleMutationError(err); }
+  }
+});
+
+$('#gr_save').addEventListener('click', async () => {
+  const payload = {
+    version: state.version,
+    name: $('#gr_name').value,
+    limit: Number($('#gr_limit').value),
+    memberIds: Array.from($('#gr_members').selectedOptions).map((o) => Number(o.value)),
+  };
+  try {
+    const next = editingGroupId
+      ? await api(`/api/groups/${editingGroupId}`, { method: 'PUT', body: payload })
+      : await api('/api/groups', { method: 'POST', body: payload });
+    applyNewState(next);
+    $('#groupModal').classList.add('hidden');
+    toast('success', editingGroupId ? '额度组已更新，余额与不可启动时段已重算' : '额度组已创建');
+  } catch (err) {
+    if (err.status === 409) { $('#groupModal').classList.add('hidden'); return handleMutationError(err); }
+    $('#gr_error').textContent = err.message;
+    $('#gr_error').classList.remove('hidden');
   }
 });
 

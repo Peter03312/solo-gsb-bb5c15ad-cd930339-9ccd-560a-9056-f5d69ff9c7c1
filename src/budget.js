@@ -51,6 +51,19 @@ function loadArtworks(db) {
   return db.prepare('SELECT * FROM artworks ORDER BY id').all();
 }
 
+// 曝光额度组：返回组记录并挂上 memberIds（作品编号数组）
+function loadGroups(db) {
+  const groups = db.prepare('SELECT * FROM quota_groups ORDER BY id').all();
+  const links = db.prepare('SELECT * FROM quota_group_members ORDER BY artwork_id').all();
+  const byGroup = new Map();
+  for (const l of links) {
+    if (!byGroup.has(l.group_id)) byGroup.set(l.group_id, []);
+    byGroup.get(l.group_id).push(l.artwork_id);
+  }
+  for (const g of groups) g.memberIds = byGroup.get(g.id) || [];
+  return groups;
+}
+
 function loadSlots(db) {
   const slots = db.prepare('SELECT * FROM slots ORDER BY planned_start, seq, id').all();
   const links = db.prepare('SELECT * FROM slot_artworks').all();
@@ -312,29 +325,93 @@ function summarize(db) {
     };
   });
 
+  // 额度组汇总：组已用 = 成员既有累计 + 已结束实际曝光；预占 = 进行中冻结 + 未开始计划；
+  // 同一时段有多件组内作品时逐件计入（成员各自累计，组取成员之和）。
+  const groupDtos = loadGroups(db).map((g) => {
+    let used = 0, reservedRunning = 0, reservedScheduled = 0;
+    for (const aid of g.memberIds) {
+      const r = acc.get(aid);
+      if (!r) continue;
+      used += r.used;
+      reservedRunning += r.reservedRunning;
+      reservedScheduled += r.reservedScheduled;
+    }
+    used = round3(used);
+    const reserved = round3(reservedRunning + reservedScheduled);
+    const committed = round3(used + reserved);
+    const balance = round3(g.limit_amount - committed);
+    return {
+      id: g.id,
+      name: g.name,
+      limit: g.limit_amount,
+      members: g.memberIds.map((aid) => {
+        const a = artworksById.get(aid);
+        return { id: aid, name: a ? a.name : `#${aid}` };
+      }),
+      used,
+      reserved,
+      reservedRunning: round3(reservedRunning),
+      reservedScheduled: round3(reservedScheduled),
+      committed,
+      balance,
+      over: balance < 0,
+    };
+  });
+
   return {
     version: db.prepare('SELECT version FROM meta WHERE id = 1').get().version,
     artworks: artworkDtos,
+    groups: groupDtos,
     slots: slots.map((s) => slotDto(s, artworksById, correctionsBySlot)),
   };
 }
 
 // ---------- 预算核算：按开始时间/编号顺序标记不可启动的时段 ----------
-// 规则：按时序逐个尝试放入未开始时段，任一关联作品余额不足即标记为不可启动
-// 并记下缺口；被标记的时段视为不会启动，不再占用后续预算。
+// 规则：按时序逐个尝试放入未开始时段，任一关联作品余额不足、或所属额度组余额不足，
+// 即标记为不可启动并记下缺口；被标记的时段视为不会启动，不再占用后续预算。
+// 组上限低于已用量时：历史（已结束）与进行中状态保留，仅后续未开始时段被阻止启动。
 function recomputeBlocked(db) {
   const slots = loadSlots(db);
   const artworks = loadArtworks(db);
+  const groups = loadGroups(db);
+  const artworksById = new Map(artworks.map((a) => [a.id, a]));
   const used = new Map(artworks.map((a) => [a.id, a.existing_amount]));
   const names = new Map(artworks.map((a) => [a.id, a.name]));
   const limits = new Map(artworks.map((a) => [a.id, a.limit_amount]));
 
+  // 组维度：作品 -> 组；组已用从成员既有累计量起算
+  const groupOf = new Map();   // artworkId -> groupId
+  const groupUsed = new Map();
+  const groupLimit = new Map();
+  const groupName = new Map();
+  for (const g of groups) {
+    groupLimit.set(g.id, g.limit_amount);
+    groupName.set(g.id, g.name);
+    let base = 0;
+    for (const aid of g.memberIds) {
+      groupOf.set(aid, g.id);
+      const a = artworksById.get(aid);
+      if (a) base += a.existing_amount;
+    }
+    groupUsed.set(g.id, base);
+  }
+  const addGroup = (aid, expo) => {
+    const gid = groupOf.get(aid);
+    if (gid != null) groupUsed.set(gid, groupUsed.get(gid) + expo);
+  };
+
   for (const s of slots) {
     if (s.status === 'finished') {
-      for (const aid of s.artworkIds) if (used.has(aid)) used.set(aid, used.get(aid) + (s.actual_exposure || 0));
+      for (const aid of s.artworkIds) {
+        if (used.has(aid)) used.set(aid, used.get(aid) + (s.actual_exposure || 0));
+        addGroup(aid, s.actual_exposure || 0);
+      }
     } else if (s.status === 'running') {
       const expo = plannedExposure(s) || 0;
-      for (const aid of s.artworkIds) if (used.has(aid)) used.set(aid, used.get(aid) + expo);
+      for (const aid of s.artworkIds) {
+        if (used.has(aid)) used.set(aid, used.get(aid) + expo);
+        addGroup(aid, expo);
+      }
     }
   }
 
@@ -362,12 +439,36 @@ function recomputeBlocked(db) {
         });
       }
     }
-    if (gaps.length > 0) {
-      upd.run(1, JSON.stringify({ gaps }), s.id);
+    // 组维度：同一时段有多件组内作品时逐件计入（需求 = 曝光 × 组内成员数）
+    const groupGaps = [];
+    const touch = new Map();   // groupId -> 本时段内该组成员件数
+    for (const aid of s.artworkIds) {
+      const gid = groupOf.get(aid);
+      if (gid != null) touch.set(gid, (touch.get(gid) || 0) + 1);
+    }
+    for (const [gid, count] of touch) {
+      const need = round3(expo * count);
+      const projected = groupUsed.get(gid) + need;
+      if (projected > groupLimit.get(gid) + 1e-9) {
+        groupGaps.push({
+          groupId: gid,
+          groupName: groupName.get(gid),
+          has: round3(groupLimit.get(gid) - groupUsed.get(gid)),  // 组当前可用余额（可为负）
+          need,                                                    // 本时段对组的需求（逐件计入）
+          gap: round3(projected - groupLimit.get(gid)),            // 组缺口
+          memberCount: count,
+        });
+      }
+    }
+    if (gaps.length > 0 || groupGaps.length > 0) {
+      upd.run(1, JSON.stringify({ gaps, groupGaps }), s.id);
       // 不可启动：不占用后续预算
     } else {
       upd.run(0, '{}', s.id);
-      for (const aid of s.artworkIds) if (used.has(aid)) used.set(aid, used.get(aid) + expo);
+      for (const aid of s.artworkIds) {
+        if (used.has(aid)) used.set(aid, used.get(aid) + expo);
+        addGroup(aid, expo);
+      }
     }
   }
   // 进行中 / 已结束时段不参与“不可启动”标记
@@ -385,6 +486,7 @@ module.exports = {
   round3,
   isNonNegNumber,
   loadArtworks,
+  loadGroups,
   loadSlots,
   loadCorrections,
   loadSegments,
